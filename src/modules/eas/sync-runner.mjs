@@ -50,7 +50,6 @@ import {
   announceableOf,
   droppedAttendees,
   isReceivedMeeting,
-  plainCopyOfInvitation,
   sameAnnounceable,
   preserveAlarmAck,
   preserveSelfPartstat,
@@ -60,6 +59,7 @@ import {
   serverKnownPartstat,
 } from "./calendar-codec.mjs";
 import { sendMeetingResponse } from "./meeting-response.mjs";
+import { findMeetingRequestLongId } from "./meeting-request-search.mjs";
 import {
   rememberClientScheduling,
   versionNeedsClientScheduling,
@@ -169,13 +169,10 @@ const INSTANCE_RETRY_DELAY_MS = Object.freeze({
   [STATUS_RETRY]: 1000,
 });
 
-// How long an answer to an invitation waits for the server to name the
-// meeting before we stop expecting it to. `invitationPhase` runs after the
-// pull, so every hold is one full sync that asked and came back without it -
-// but a mailbox can be a little behind its own inbox, and this is the room
-// that gives it. Long, because what follows is not reversible: the meeting
-// becomes the user's own event and the guest list is gone.
-const INVITATION_HOLD_MS = 2 * 60 * 60 * 1000;
+// Escalate a missing invitation ServerId after two hours. Elapsed time
+// cannot establish whether the server holds the meeting, so it changes
+// only the log level, never the invitation or its queued answer.
+const INVITATION_WARNING_MS = 2 * 60 * 60 * 1000;
 
 /* ── DEV: fixture injection ─────────────────────────────────────────────
  *
@@ -1583,9 +1580,9 @@ async function pushPhase(ctx, userEdits) {
  *  Each entry is a queued edit to a meeting somebody else organises. The
  *  only thing we may tell the server about one is the user's answer, and
  *  MeetingResponse is how - [MS-ASCMD] 2.2.2.10. It addresses the item by
- *  `RequestId`, which is its ServerId, so this runs after the pull: an
- *  invitation Thunderbird filed from the email has no ServerId at all until
- *  the server's own copy has come down and been adopted onto it.
+ *  `RequestId`, which is its ServerId, so this runs after the pull. When
+ *  there is no calendar ServerId, 16.x can instead address the original
+ *  meeting-request email by its Search LongId, matched by exact UID.
  *
  *  Nothing here waits. Exchange acknowledges receipt and applies the answer
  *  to the calendar afterwards - measured at absent after 24 s and present
@@ -1597,7 +1594,7 @@ async function pushPhase(ctx, userEdits) {
  *  sent later. The difference matters: a kept entry lights the needs-sync
  *  badge until it goes, so keeping one that can never go leaves a badge
  *  nobody can clear. */
-async function invitationPhase(ctx, entries) {
+export async function invitationPhase(ctx, entries) {
   // Responding to an invitation from the calendar item is 14.0 and later.
   // Below that the only way is the meeting request in the Inbox, and we do
   // not sync mail - so these can never be sent, at all, ever.
@@ -1666,32 +1663,31 @@ async function invitationPhase(ctx, entries) {
       await dropEntry(ctx, entry);
       continue;
     }
-    const serverID = ctx.itemKind.codec.readEasServerIdFromBlob(item.blob);
-    if (!serverID) {
-      // The user answered before we had ever seen the server's copy. Usually
-      // it arrives, is adopted onto this item and brings an id with it, so
-      // waiting is right and this stays queued for the next sync.
-      //
-      // But it may never come: an invitation addressed to somebody else and
-      // only redirected here was never created in this mailbox, so there is
-      // no copy to wait for and no id will ever exist. Nothing readable on
-      // the item says which of the two this is - Thunderbird repairs the
-      // guest list when it files such an invitation - and only time can
-      // tell them apart.
+    // As in the push phase, an iTIP replacement may have dropped the
+    // cached stamp while the folder index still knows the server's id.
+    const serverID =
+      ctx.itemKind.codec.readEasServerIdFromBlob(item.blob) ??
+      ctx.indexMap.serverIdFor(entry.itemId);
+    // An invitation filed from email may not yet have a calendar copy.
+    // Search can identify its source request by exact UID on 16.x. Its
+    // LongId is temporary addressing information, never a calendar stamp.
+    // Responding to source mail creates the item in the default Calendar.
+    // Other/shared calendars cannot safely adopt that returned CalendarId.
+    const canSearchSource = String(ctx.folder?.custom?.type) === "8";
+    const longId = serverID || !canSearchSource ? null : await findMeetingRequestLongId({
+      account: ctx.account, asVersion: ctx.asVersion, blob: item.blob,
+    });
+    if (!serverID && !longId) {
+      // A later pull may adopt the server's copy and supply its id. We
+      // cannot distinguish delay, an unmatched UID or an absent server
+      // copy here. Keep both the invitation and the user's answer intact.
       const heldMs = Date.now() - (entry.timestamp ?? 0);
-      if (heldMs < INVITATION_HOLD_MS) {
-        const leftMin = Math.max(
-          1,
-          Math.round((INVITATION_HOLD_MS - heldMs) / 60_000),
-        );
-        ctx.eventLog(
-          "info",
-          `[event-sync] holding the answer to ${entry.itemId}: the server has not ` +
-            `named this meeting yet - ${leftMin} min before it becomes a plain event`,
-        );
-        continue;
-      }
-      await convertHeldInvitation(ctx, entry, item, heldMs);
+      ctx.eventLog(
+        heldMs >= INVITATION_WARNING_MS ? "warning" : "info",
+        `[event-sync] holding the answer to ${entry.itemId}: no ServerId is ` +
+          `available for this invitation; keeping the invitation and its ` +
+          `answer unchanged for a later sync`,
+      );
       continue;
     }
 
@@ -1737,6 +1733,7 @@ async function invitationPhase(ctx, entries) {
         asVersion: ctx.asVersion,
         collectionId: ctx.collectionId,
         serverID,
+        ...(longId ? { longId } : {}),
         userResponse: answer.userResponse,
         instanceId: answer.instanceId,
       });
@@ -1803,12 +1800,14 @@ async function invitationPhase(ctx, entries) {
       continue;
     }
     const status = lastStatus;
-    // 2 is an invalid meeting request and 4 a meeting that cannot be
+    // A rejected source email may be stale; leave its answer queued so a
+    // later pull can provide the calendar identity instead. With a known
+    // calendar ServerId, 2 is an invalid meeting request and 4 one that cannot be
     // responded to - a cancelled one, or somebody else's delegate. Neither
     // improves by being retried, and a queue entry that can never go is a
     // badge that can never clear. 3 is a server-side sync-state problem
     // that does improve, so that one waits.
-    if (status === "2" || status === "4") {
+    if (!longId && (status === "2" || status === "4")) {
       ctx.provider.reportEventLog({
         level: "warning",
         accountId: ctx.accountId,
@@ -1826,50 +1825,6 @@ async function invitationPhase(ctx, entries) {
         `(${status ? `Status ${status}` : "no response"}); leaving it queued`,
     );
   }
-}
-
-/**
- * Stop waiting for a meeting the server is never going to name, and let the
- * user keep the appointment as their own.
- *
- * Reached only after `INVITATION_HOLD_MS` of holding, which - because
- * `invitationPhase` runs after the pull - is that many syncs that asked the
- * server and came back without this meeting.
- *
- * The queue entry is deliberately left alone. It is an `added_by_user` and
- * stays one, and the rewrite is what releases it: with the mailbox as
- * `ORGANIZER` the item is no longer a received meeting, so the next sync's
- * push dispatcher does not divert it, and it goes out through `pushPhase`
- * as an ordinary `<Add>` - the only command that could work, there being no
- * ServerId to address a `<Change>` to.
- *
- * The write goes through the store like every other write this file makes,
- * which means `<id>#cache` and therefore no item hook: the rewrite cannot
- * come back as a fresh user edit.
- */
-async function convertHeldInvitation(ctx, entry, item, heldMs) {
-  const heldHours = Math.max(1, Math.round(heldMs / 3_600_000));
-  const plain = plainCopyOfInvitation(item.blob, {
-    summaryPrefix: browser.i18n.getMessage(
-      "calendar.invitationCopy.summaryPrefix",
-    ),
-    // The address the diversion compares against, so that this is certain
-    // to stop looking like somebody else's meeting.
-    organizer: accountUserAddress(ctx.account),
-  });
-  await ctx.queue.markServerWrite({
-    parentId: ctx.targetID,
-    itemId: entry.itemId,
-    status: SERVER_TAG_STATUSES[1],
-    kind: ctx.itemKind.changelogKind,
-  });
-  await ctx.store.update(entry.itemId, plain);
-  ctx.eventLog(
-    "warning",
-    `[event-sync] the answer to ${entry.itemId} could not be sent for ` +
-      `${heldHours} h - this mailbox holds no copy of the meeting, so it has ` +
-      `been kept as a plain event and the guest list dropped`,
-  );
 }
 
 /** Take a queued edit out of the queue, having established that nothing
