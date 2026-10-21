@@ -38,8 +38,12 @@ Microsoft 365 przechowuje powiązany termin. Nie przekazujemy maili do Exchange.
   bez błędów startowych; rejestracja dostawcy, zapis i czyszczenie terminu,
   natywny wybór transportu REPLY oraz interfejs transportu — PASS.
 - Pozostaje znane ostrzeżenie manifestu o calendar_provider.
-- Nie wykonano testowej synchronizacji ani wysyłki na rzeczywistym koncie.
-  Profil produkcyjny pozostaje bez zmian.
+- Autor nie uruchamiał synchronizacji ani wysyłki na rzeczywistym koncie.
+  Użytkownik zainstalował kandydata i wykonał własną próbę po włączeniu opcji.
+  Dostarczony log potwierdza pobranie wpisu z Microsoft 365 z ClientUid
+  źródłowego zaproszenia i ServerId. Zawiera też Change/Status 7 (konflikt),
+  po którym serwer zwrócił swój wpis. Nie jest to dowód powodzenia aktualizacji.
+  Nie potwierdzono jeszcze SMTP REPLY, wyższego SEQUENCE ani usunięcia z Teams.
 
 ## Granice
 
@@ -64,5 +68,5 @@ Wycofanie: wyłącz nową opcję i przywróć poprzedni XPI. Nie usuwa to źród
 zaproszeń. Powrót do starej wersji nie zapewnia obsługi nowych oznaczonych
 zaproszeń; zachowaj pełną kopię profilu. Nie resetuj kalendarza ani konta.
 
-PR #369 pozostaje zamknięty bez scalania. Ten kandydat wymaga kontrolowanego
-testu Microsoft 365 przed uznaniem poprawki za gotową i publikacją nowego PR.
+PR #369 pozostaje zamknięty bez scalania. Nowy PR jest roboczy. Pełny cykl
+odpowiedzi, aktualizacji i usunięcia w Microsoft 365 wymaga dalszego testu.
